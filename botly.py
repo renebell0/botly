@@ -2,12 +2,21 @@
 
 import os
 import logging
-import requests
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin, quote_plus
 from threading import Thread
 from flask import Flask
-import signal # Importamos la librería para manejar señales del sistema
+import signal
+
+# --- Selenium Imports ---
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+# ------------------------
+
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, quote_plus
+import requests
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -27,37 +36,60 @@ def index():
     return "Bot is alive!"
 
 def run_flask():
-    # Render proporciona el puerto a través de la variable de entorno PORT
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
 
 # --- CONFIGURACIÓN DEL BOT ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 BASE_URL = "https://annas-archive.org"
-RESULTS_PER_PAGE = 10
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# --- LÓGICA DE SCRAPING (Sin cambios) ---
+
+# --- LÓGICA DE SCRAPING CON SELENIUM (SOLUCIÓN EXPERTA) ---
+
+def setup_selenium_driver():
+    """Configura el driver de Selenium para ejecutarse en el entorno de Render."""
+    chrome_options = webdriver.ChromeOptions()
+    # Estas opciones son cruciales para correr en un servidor sin interfaz gráfica
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--window-size=1920,1080")
+    
+    # Render instala chromium en esta ruta
+    service = Service(executable_path="/usr/bin/chromedriver")
+    driver = webdriver.Chrome(service=service, options=chrome_options)
+    return driver
+
 def buscar_libros(query: str, page: int = 1):
-    safe_query = quote_plus(query)
-    search_url = f"{BASE_URL}/search?q={safe_query}&page={page}&sort=relevant"
-    logger.info(f"Searching URL: {search_url}")
+    """
+    Busca libros usando un navegador real (Selenium) para manejar JavaScript.
+    """
+    driver = None
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-        response = requests.get(search_url, headers=headers, timeout=20)
-        logger.info(f"Anna's Archive response status: {response.status_code}")
-        if response.status_code != 200:
-            logger.error(f"Failed to fetch from Anna's Archive. Status: {response.status_code}")
-            return None
-        soup = BeautifulSoup(response.text, 'lxml')
+        driver = setup_selenium_driver()
+        safe_query = quote_plus(query)
+        search_url = f"{BASE_URL}/search?q={safe_query}&page={page}&sort=relevant"
+        logger.info(f"Navigating to URL with Selenium: {search_url}")
+        
+        driver.get(search_url)
+
+        # Espera explícita: Esperamos un máximo de 20 segundos a que al menos
+        # un elemento de resultado sea visible. Esta es la clave.
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "a[href^='/md5/']"))
+        )
+
+        # Una vez que la página está cargada, obtenemos el HTML y lo pasamos a BeautifulSoup
+        soup = BeautifulSoup(driver.page_source, 'lxml')
+        
         result_links = soup.select("a[href^='/md5/']")
-        if not result_links:
-            logger.warning("No result links found on page. HTML structure may have changed.")
-            return {"libros": [], "has_next_page": False}
+        
         libros = []
         for link in result_links:
             titulo_div = link.find('div', class_='text-lg')
@@ -67,16 +99,19 @@ def buscar_libros(query: str, page: int = 1):
                 autor = autor_div.get_text(strip=True)
                 md5_hash = link['href'].split('/md5/')[1]
                 libros.append({"titulo": titulo, "autor": autor, "md5": md5_hash})
+
         has_next_page = soup.find('a', string='Next') is not None
         logger.info(f"Found {len(libros)} books on page {page} for query '{query}'.")
         return {"libros": libros, "has_next_page": has_next_page}
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Request to Anna's Archive failed: {e}")
-        return None
+
     except Exception as e:
         logger.error(f"An unexpected error occurred during scraping: {e}", exc_info=True)
         return None
+    finally:
+        if driver:
+            driver.quit() # Es crucial cerrar el navegador para liberar recursos
 
+# La función para obtener detalles no necesita Selenium, `requests` es suficiente y más rápido.
 def obtener_detalles_libro(md5: str):
     detail_url = f"{BASE_URL}/md5/{md5}"
     try:
@@ -176,24 +211,18 @@ def main() -> None:
         logger.error("¡No se encontró el TELEGRAM_TOKEN!")
         return
     
-    # Iniciar el servidor Flask en un hilo separado
     flask_thread = Thread(target=run_flask)
     flask_thread.start()
         
-    # Iniciar el bot de Telegram
     updater = Updater(TELEGRAM_TOKEN)
     dispatcher = updater.dispatcher
     
-    # --- MANEJO DE SEÑALES PARA APAGADO LIMPIO ---
-    # Esto asegura que cuando Render envíe la señal de parada (SIGTERM),
-    # el bot se desconecte de Telegram antes de que el proceso muera.
     def shutdown(signum, frame):
         logger.info("Señal de apagado recibida. Deteniendo el bot...")
         updater.stop()
 
     signal.signal(signal.SIGTERM, shutdown)
-    signal.signal(signal.SIGINT, shutdown) # También para Ctrl+C localmente
-    # ---------------------------------------------
+    signal.signal(signal.SIGINT, shutdown)
     
     dispatcher.add_handler(CommandHandler("start", start_command))
     dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_search))
@@ -201,7 +230,7 @@ def main() -> None:
 
     updater.start_polling()
     logger.info("Bot iniciado y listo para recibir comandos.")
-    updater.idle() # Mantiene el bot corriendo hasta que se recibe una señal de apagado
+    updater.idle()
 
 if __name__ == '__main__':
     main()

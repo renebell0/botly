@@ -7,6 +7,7 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin, quote_plus
 from threading import Thread
 from flask import Flask
+import signal # Importamos la librería para manejar señales del sistema
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -40,59 +41,41 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- LÓGICA DE SCRAPING MEJORADA Y CORREGIDA ---
+# --- LÓGICA DE SCRAPING (Sin cambios) ---
 def buscar_libros(query: str, page: int = 1):
-    """
-    Busca libros en Anna's Archive con soporte para paginación y selectores robustos.
-    """
     safe_query = quote_plus(query)
     search_url = f"{BASE_URL}/search?q={safe_query}&page={page}&sort=relevant"
     logger.info(f"Searching URL: {search_url}")
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
         response = requests.get(search_url, headers=headers, timeout=20)
-        
         logger.info(f"Anna's Archive response status: {response.status_code}")
         if response.status_code != 200:
             logger.error(f"Failed to fetch from Anna's Archive. Status: {response.status_code}")
             return None
-
         soup = BeautifulSoup(response.text, 'lxml')
-        
-        # --- CORRECCIÓN CRÍTICA ---
-        # Usamos un selector CSS más estable para encontrar los enlaces de resultados.
-        # Esto busca cualquier enlace 'a' cuyo atributo 'href' comience con '/md5/'.
         result_links = soup.select("a[href^='/md5/']")
-        
         if not result_links:
             logger.warning("No result links found on page. HTML structure may have changed.")
             return {"libros": [], "has_next_page": False}
-
         libros = []
         for link in result_links:
-            # Verificamos que el enlace contenga la estructura de un resultado principal
-            # (un título y un autor) para evitar capturar otros enlaces.
             titulo_div = link.find('div', class_='text-lg')
             autor_div = link.find('div', class_='italic')
-
             if titulo_div and autor_div:
                 titulo = titulo_div.get_text(strip=True)
                 autor = autor_div.get_text(strip=True)
                 md5_hash = link['href'].split('/md5/')[1]
                 libros.append({"titulo": titulo, "autor": autor, "md5": md5_hash})
-
         has_next_page = soup.find('a', string='Next') is not None
-        
         logger.info(f"Found {len(libros)} books on page {page} for query '{query}'.")
         return {"libros": libros, "has_next_page": has_next_page}
-
     except requests.exceptions.RequestException as e:
         logger.error(f"Request to Anna's Archive failed: {e}")
         return None
     except Exception as e:
         logger.error(f"An unexpected error occurred during scraping: {e}", exc_info=True)
         return None
-
 
 def obtener_detalles_libro(md5: str):
     detail_url = f"{BASE_URL}/md5/{md5}"
@@ -201,13 +184,24 @@ def main() -> None:
     updater = Updater(TELEGRAM_TOKEN)
     dispatcher = updater.dispatcher
     
+    # --- MANEJO DE SEÑALES PARA APAGADO LIMPIO ---
+    # Esto asegura que cuando Render envíe la señal de parada (SIGTERM),
+    # el bot se desconecte de Telegram antes de que el proceso muera.
+    def shutdown(signum, frame):
+        logger.info("Señal de apagado recibida. Deteniendo el bot...")
+        updater.stop()
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown) # También para Ctrl+C localmente
+    # ---------------------------------------------
+    
     dispatcher.add_handler(CommandHandler("start", start_command))
     dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_search))
     dispatcher.add_handler(CallbackQueryHandler(callback_router))
 
     updater.start_polling()
     logger.info("Bot iniciado y listo para recibir comandos.")
-    updater.idle()
+    updater.idle() # Mantiene el bot corriendo hasta que se recibe una señal de apagado
 
 if __name__ == '__main__':
     main()

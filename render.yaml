@@ -1,9 +1,17 @@
+# render.yaml
 services:
-  - type: worker
+  - type: web
     name: telegram-book-bot
     env: python
+    # Le decimos a Render que use el Buildpack de Chrome para instalar el navegador
+    buildPacks:
+      - heroku/python
+      - heroku/google-chrome
+    # El comando de compilación ahora solo necesita instalar las dependencias de Python
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python bot.py"
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9 # Usamos una versión de Python compatible y estable
       - key: TELEGRAM_TOKEN
         sync: false

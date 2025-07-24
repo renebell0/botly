@@ -5,6 +5,7 @@ import logging
 from threading import Thread
 from flask import Flask
 import signal
+import selenium
 
 # --- Selenium Imports ---
 from selenium import webdriver

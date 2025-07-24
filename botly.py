@@ -5,7 +5,7 @@ import logging
 from threading import Thread
 from flask import Flask
 import signal
-import selenium
+import time
 
 # --- Selenium Imports ---
 from selenium import webdriver
@@ -50,26 +50,28 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# --- LÓGICA DE SCRAPING CON SELENIUM (SOLUCIÓN EXPERTA) ---
+# --- LÓGICA DE SCRAPING CON SELENIUM (SOLUCIÓN EXPERTA v3) ---
 
 def setup_selenium_driver():
     """Configura el driver de Selenium para ejecutarse en el entorno de Render."""
     chrome_options = webdriver.ChromeOptions()
-    # Estas opciones son cruciales para correr en un servidor sin interfaz gráfica
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920,1080")
     
-    # Render instala chromium en esta ruta
-    service = Service(executable_path="/usr/bin/chromedriver")
-    driver = webdriver.Chrome(service=service, options=chrome_options)
+    # --- CORRECCIÓN DEFINITIVA ---
+    # Eliminamos la ruta fija. Dejamos que Selenium encuentre automáticamente
+    # el chromedriver que el buildpack de Render instala.
+    driver = webdriver.Chrome(options=chrome_options)
+    # -----------------------------
+    
     return driver
 
 def buscar_libros(query: str, page: int = 1):
     """
-    Busca libros usando un navegador real (Selenium) para manejar JavaScript.
+    Busca libros usando un navegador real (Selenium) con esperas robustas.
     """
     driver = None
     try:
@@ -80,16 +82,20 @@ def buscar_libros(query: str, page: int = 1):
         
         driver.get(search_url)
 
-        # Espera explícita: Esperamos un máximo de 20 segundos a que al menos
-        # un elemento de resultado sea visible. Esta es la clave.
-        WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "a[href^='/md5/']"))
+        # Esperamos a que el contenedor principal de los resultados sea visible.
+        WebDriverWait(driver, 25).until(
+            EC.visibility_of_element_located((By.XPATH, "//div[contains(@class, 'grid-cols-1')]"))
         )
+        time.sleep(2) # Pausa por si algún elemento tarda más en renderizar
 
-        # Una vez que la página está cargada, obtenemos el HTML y lo pasamos a BeautifulSoup
         soup = BeautifulSoup(driver.page_source, 'lxml')
         
-        result_links = soup.select("a[href^='/md5/']")
+        main_container = soup.find('div', class_=lambda c: c and 'grid-cols-1' in c)
+        if not main_container:
+             logger.warning("Main results container not found.")
+             return {"libros": [], "has_next_page": False}
+
+        result_links = main_container.select("a[href^='/md5/']")
         
         libros = []
         for link in result_links:
@@ -110,9 +116,8 @@ def buscar_libros(query: str, page: int = 1):
         return None
     finally:
         if driver:
-            driver.quit() # Es crucial cerrar el navegador para liberar recursos
+            driver.quit()
 
-# La función para obtener detalles no necesita Selenium, `requests` es suficiente y más rápido.
 def obtener_detalles_libro(md5: str):
     detail_url = f"{BASE_URL}/md5/{md5}"
     try:
